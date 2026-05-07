@@ -18,10 +18,9 @@ This package provides COI (CERN optimization interfaces) optimization environmen
 ```
 isolde_offline_optimizer/
 ├── __init__.py              # Package initialization and exports
-├── todos.py                 # Project todos and notes
 ├── envs/
 │   ├── __init__.py          # Environment module initialization
-│   ├── base_env.py          # Base class for BTY line optimization
+│   ├── base_env.py          # Base class for OFFLINE beam optimization
 │   └── env_yol1.py          # YOL1 optimization environment
 │   └── env_yol2.py          # YOL2 optimization environment
 ├── utils/
@@ -31,10 +30,6 @@ isolde_offline_optimizer/
 │   ├── event_serializer.py  # Event serialization utilities
 │   └── params.py            # Parameter configuration dataclass
 │   └── utils_pjlsa.py       # Functions for controlling accelerator devices
-├── playground/
-│   ├── 001_tapestation_acquisition.py  # Tapestation acquisition testing
-│   ├── 002_all_acquisition.py          # Full acquisition testing
-│   └── antons_complaint.txt            # Development notes
 └── tests/
     └── test_env.py                      # Environment tests
 ```
