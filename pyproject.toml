@@ -1,0 +1,143 @@
+[build-system]
+requires = [
+    'setuptools >= 61',
+    'wheel >= 0.36',
+    'setuptools-scm[toml] >= 7.0',
+]
+build-backend = 'setuptools.build_meta'
+
+[project]
+dynamic = ['version']
+name = 'isolde-offline-optimizer'
+description = 'COI env for ISOLDE OFFLINE optimization'
+readme = 'README.md'
+authors = [
+    {name = 'Line Le', email = 'line.le@cern.ch'},
+]
+requires-python = '>=3.9'
+classifiers = [
+    'Development Status :: 3 - Alpha',
+    'Environment :: X11 Applications :: Qt',
+    'Intended Audience :: Science/Research',
+    'License :: Other/Proprietary License',
+    'Natural Language :: English',
+    'Operating System :: POSIX :: Linux',
+    'Programming Language :: Python :: 3 :: Only',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.11',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'Topic :: Scientific/Engineering :: Physics',
+]
+dependencies = [
+    'acc-app-optimisation >= 0.17.7',
+    'cernml-coi >= 0.9',
+    'cernml-coi-utils ~= 0.3',
+    'cernml-coi-optimizers ~= 3.0.0',
+    'gymnasium ~= 0.29.1',
+    'numpy ~= 1.26.4',
+    'pandas ~= 2.2.3',
+    'pyjapc ~= 2.5',
+    'matplotlib ~= 3.0',
+    'pyda ~= 1.0.9',
+    'pyda-japc ~= 1.0.3',
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest >= 6.0",
+]
+
+dev = [
+    # "requirement-for-development-purposes-only",
+]
+
+doc = [
+    "sphinx",
+    "acc-py-sphinx",
+]
+
+[project.urls]
+gitlab = '...'
+
+[tool.setuptools]
+zip-safe = true
+
+[tool.setuptools_scm]
+write_to = "isolde_offline_optimizer/_version.py"
+local_scheme = "no-local-version"
+
+[tool.pytest.ini_options]
+addopts = '--ignore=isolde_offline_optimizer/envs --ignore=isolde_offline_optimizer/playground --ignore=isolde_offline_optimizer/utils'
+testpaths = ['isolde_offline_optimizer/tests']
+norecursedirs = ['playground', '.*', 'build', 'dist', '*.egg']
+python_files = ['test_*.py']
+doctest_optionflags = ['IGNORE_EXCEPTION_DETAIL']
+
+[tool.coverage.run]
+source = ['isolde_offline_optimizer']
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+    '^\s*@.*\.overload$',
+    '^\s*def __del__',
+    '^\s*except ImportError:$',
+    '^\s*from .* import',
+    '^\s*if .*\.TYPE_CHECKING:$',
+    '^\s*if sys\.version_info ..? \(\d, \d+\):$',
+    '^if __name__ == "__main__":$',
+    '^\s*import ',
+    '^\s*raise NotImplementedError',
+]
+omit = ['*/tests/*', '*/playground/*']
+show_missing = true
+skip_covered = true
+
+[tool.black]
+target-version = ['py39']
+
+[tool.isort]
+profile = 'black'
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+line_length = 140
+force_sort_within_sections = true
+
+[tool.pylint]
+main.ignore-patterns = ['.*\.pyi$', 'test_.*\.py$']
+'messages control'.disable = ['all']
+'messages control'.enable = [
+    'F',
+    'bad-inline-option',
+    'cell-var-from-loop',
+    # TODO: These require a lot of fixes.
+    # 'missing-class-docstring',
+    # 'missing-function-docstring',
+    # 'missing-module-docstring',
+    'singledispatch-method',
+    'singledispatchmethod-function',
+    'super-init-not-called',
+    'typevar-double-variance',
+    'typevar-name-incorrect-variance',
+    'typevar-name-mismatch',
+    'unrecognized-inline-option',
+    'unrecognized-option',
+]
+
+[tool.mypy]
+disallow_untyped_defs = true
+explicit_package_bases = true
+mypy_path = '$MYPY_CONFIG_FILE_DIR/src'
+
+[[tool.mypy.overrides]]
+module = [
+    'gymnasium.*',
+    'jpype.*',
+    'scipy.*',
+    'skopt.*',
+    'pjlsa.*',
+]
+ignore_missing_imports = true

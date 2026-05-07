@@ -1,0 +1,1128 @@
+import logging
+import re
+import time
+import typing as t
+
+import numpy as np
+import numpy.typing as npt
+from scipy.optimize import curve_fit
+
+from types import SimpleNamespace
+from abc import abstractmethod
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+import gymnasium as gym
+from cernml import coi
+from cernml.coi import cancellation
+from cernml.coi.protocols import InfoDict
+from cernml.mpl_utils import FigureRenderer, RenderGenerator
+from cernml.gym_utils import Scaler
+from cernml.optimizers._interface import Optimizer
+from isolde_offline_optimizer.customOpt.custom_opt import BayesianOptimizer
+
+import pjlsa
+import pyda
+import pyda_japc
+from numpy.core.records import ndarray
+from pyjapc import PyJapc
+
+from scipy.signal import find_peaks, peak_widths, butter, filtfilt
+
+import isolde_offline_optimizer.utils as utl
+from scipy.optimize import OptimizeWarning, curve_fit
+import warnings
+
+#from isolde_offline_optimizer.envs.env_yol1 import IsoldeOfflineEnv
+
+if t.TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
+# TODO: Extract some of the methods from the Env class
+
+# TODO: REMOVE - Set to False for production version
+DEBUG = False
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+LOG = logging.getLogger(__name__)
+
+if DEBUG:
+    LOG.warning("Running env in DEBUG mode: no hardware changes will be applied.")
+
+# Japc provider and lsa_utils for scalar_trims
+japc_provider = pyda_japc.JapcProvider()
+with pjlsa.LSAClient(server="isolde").java_api():
+    from cernml.lsa_utils import trim_scalar_settings
+    import isolde_offline_optimizer.utils.utils_pjlsa as lsa
+
+class IsoldeOfflineBaseEnv(coi.SingleOptimizable, coi.Configurable, coi.CustomOptimizerProvider):
+    metadata = {
+        "cern.machine": coi.Machine.ISOLDE,
+        "cern.japc": False,
+        "render_modes": ["matplotlib_figures"],
+        "cern.cancellable": True,
+    }
+    _env_name: str = "IsoldeOfflineEnv"
+    _target: str = ""
+    _data_dir: Path = Path("./")
+    _tapestation_field: str = "measurement1Count"
+
+    taus = np.array([0, 0, 0, 0])
+    n_constraints = len(taus)
+    constraints_values = np.zeros(n_constraints)
+
+    @classmethod
+    def get_optimizers(cls) -> t.Mapping[str, Optimizer]:
+        return {
+            "BayesianOpt": BayesianOptimizer(env_cls=IsoldeOfflineBaseEnv),
+        }
+
+    def __init__(
+        self,
+        cancellation_token: t.Optional[cancellation.Token] = None,
+    ) -> None:
+        LOG.info(f"Initializing {self._env_name} for target {self._target}")
+        # TODO: this is ugly, but we will eventually get rid of the japc
+        # instance and pass a japc_provider instead. For now needed because
+        # COI / Geoff has not yet been migrated to pyda.
+        # self._japc = japc
+        self._japc_provider = japc_provider
+        self._pyda_client = pyda.SimpleClient(provider=self._japc_provider)
+        self._acq_parameter = "Detector"
+        self._step_type = "Relative"
+        self.detector_name = "FC120"
+        self.scanner_name = "BSC330"
+        self._subs = []
+        self.num_measurements = 1
+        self.fc_detector_scale = 0.1e9
+        self._token = (
+            cancellation_token
+            if cancellation_token is not None
+            else cancellation.Token()
+        )
+        LOG.debug(f"Cancellation token initialized: {self._token}")
+
+        self._all_params = self._setup_parameters()
+        LOG.info(f"Parameters configured: {len(self._all_params)} parameters defined")
+
+        self._data_path = Path(self._data_dir)
+        self._data_path.mkdir(parents=True, exist_ok=True)
+        LOG.info(f"Data directory: {self._data_path.absolute()}")
+
+        """
+        self._beam_presence_bct_addr: str | None = next(
+        self._beam_presence_bct_addr: str | None = next(
+            (x for x in self._subs if x.startswith("BTY.BCT")),
+            None,
+        )"""
+        self._beam_presence_threshold: float = 15.0
+
+        self._n_acqs_avg: int = 1
+
+        self._run_number: int | None = None
+        self._iteration_counter: int = -1
+        self._acquisition_index: int = 0
+
+        # Beam size tracking for plotting
+        self._beam_sigma_h_history: list[float] = []
+        self._beam_sigma_v_history: list[float] = []
+        self._beam_sigma_h_std_history: list[float] = []
+        self._beam_sigma_v_std_history: list[float] = []
+        self._iteration_history: list[int] = []
+
+        # Initialize renderer for custom plotting
+        self.renderer = FigureRenderer.from_callback(
+            self.iter_updates, "Beam Size Evolution", render_mode="matplotlib_figures"
+        )
+
+        super().__init__()
+        LOG.info(f"{self._env_name} initialization complete")
+
+    @abstractmethod
+    def _setup_parameters(self) -> dict[str, utl.ParamConfig]:
+        """Set up dictionary self._all_params with all the parameters
+        relevant for the optimization."""
+        pass
+
+    @abstractmethod
+    def _detector_subscriptions(self) -> dict[str, str]:
+        """Set up list self._subs with all device/property addresses for
+        detector acquisition."""
+        pass
+
+    @abstractmethod
+    def _scanner_subscriptions(self) -> dict[str, str]:
+        """Set up list self._subs with all device/property addresses for
+        scanner acquisition."""
+        pass
+
+    def _determine_run_number(self) -> int:
+        """Determine the next run number by scanning existing Run_XXX directories.
+
+        Returns:
+            Next run number (0 if no runs exist, max+1 otherwise)
+        """
+        if not self._data_path.exists():
+            LOG.info("Data path does not exist yet, starting with Run_000")
+            return 0
+
+        run_pattern = re.compile(r"^Run_(\d{3})$")
+        existing_runs = []
+
+        for item in self._data_path.iterdir():
+            if item.is_dir():
+                match = run_pattern.match(item.name)
+                if match:
+                    run_num = int(match.group(1))
+                    existing_runs.append(run_num)
+
+        if not existing_runs:
+            LOG.info("No existing runs found, starting with Run_000")
+            return 0
+
+        next_run = max(existing_runs) + 1
+        LOG.info(
+            f"Found {len(existing_runs)} existing run(s), starting Run_{next_run:03d}"
+        )
+        return next_run
+
+    @property
+    def optimization_space(self) -> gym.spaces.Box:
+        """Return the optimization space as a gymnasium Box."""
+        return gym.spaces.Box(-1, 1, shape=(len(self._param_addrs),))
+
+    @property
+    def _param_addrs(self) -> list[str]:
+        """Get list of enabled parameter addresses."""
+        return [config.addr for _, config in self._all_params.items() if config.enabled]
+
+    @property
+    def _param_tolerances(self) -> list[float]:
+        """Get list of parameter tolerances (settings wrt readback)."""
+        return [
+            config.tolerance for _, config in self._all_params.items() if config.enabled
+        ]
+
+    @property
+    def _param_scales(self) -> list[float]:
+        """Get list of parameter +/- max deviations."""
+        return [
+            config.scale for _, config in self._all_params.items() if config.enabled
+        ]
+
+    @property
+    def _param_readback_addrs(self) -> list[str]:
+        """Get list of parameter readback addresses."""
+        result: list[str] = []
+        for _, config in self._all_params.items():
+            if not config.enabled:
+                continue
+            readback_addr = config.addr.replace("SettingPPM", "Acquisition")
+            if readback_addr == config.addr:
+                # Replacement didn't happen - address doesn't contain "SettingPPM"
+                LOG.warning(
+                    f"Parameter address '{config.addr}' does not contain 'SettingPPM', "
+                    f"using as-is for readback"
+                )
+            result.append(readback_addr)
+        return result
+
+    def _fetch_initial_vals(self) -> np.ndarray:
+        """Get initial values for all enabled parameters."""
+        initial_currents = []
+        for p in self._param_addrs:
+            res = self._pyda_client.get(
+                endpoint=p,
+                context="",
+            )
+            initial_currents.append(res.data["ccv1"])
+        LOG.info(f"Fetched initial_currents {initial_currents}")
+        return np.array(initial_currents)
+
+    def get_config(self) -> coi.Config:
+        """Set up config dialog for Geoff GUI."""
+        config = coi.Config()
+
+        config.add(
+            "_acq_parameter",
+            self._acq_parameter,
+            label="Acquisition Parameter",
+            help="Available Acquisition Parameters",
+            choices=["Detector", "Scanner"]
+        )
+
+        config.add(
+            "_step_type",
+            self._step_type,
+            label="Step Type",
+            help="Step Type: Relative or Absolute",
+            choices=["Relative", "Absolute"]
+        )
+
+        config.add(
+            "detector_name",
+            self.detector_name,
+            label="Faraday cups",
+            help="Available FC devices",
+            choices=["FC120", "FC80", "FC110", "FC180", "FC190"]
+        )
+
+        config.add(
+            "scanner_name",
+            self.scanner_name,
+            label="Beam scanners",
+            help="Available scanner devices",
+            choices=["BSC330", "BS70", "BS100", "BS170"]
+        )
+
+        config.add(
+            "_n_acqs_avg",
+            self._n_acqs_avg,
+            label="Nb acqs. for avg.",
+            help="Number of acquisitions per parameter setting",
+        )
+
+        taus_str = self._convert_taus_to_str()
+        config.add("taus", taus_str, label="List of constraint thresholds (tau1, tau2, tau3, tau4)",
+                   help="Acceptable limits (normalized) for each constraint.")
+
+        config.add(
+            "_beam_presence_threshold",
+            self._beam_presence_threshold,
+            label="Intensity threshold (E10 p)",
+            help="Beam presence intensity requirement",
+        )
+        for p, v in self._all_params.items():
+            config.add(f"enable_{p}", v.enabled, label=p)
+            config.add(
+                f"scale_{p}",
+                v.scale,
+                label=f"   +/- max. dev. ({v.units})",
+            )
+        return config
+
+    def apply_config(self, values: SimpleNamespace) -> None:
+        """Apply config by updating internal values based on
+        dialog inputs."""
+
+        LOG.info("Applying configuration changes")
+        # Update enabled params
+        any_enabled = False
+        enabled_params = []
+        disabled_params = []
+        for p, v in self._all_params.items():
+            enable_ = getattr(values, f"enable_{p}")
+            v.enabled = enable_
+            if enable_:
+                any_enabled = True
+                enabled_params.append(p)
+            else:
+                disabled_params.append(p)
+
+        LOG.info(f"Enabled parameters: {enabled_params}")
+        if disabled_params:
+            LOG.info(f"Disabled parameters: {disabled_params}")
+
+        # Update scales (+/- max. deviations)
+        scale_changes = []
+        for p, v in self._all_params.items():
+            scale_ = getattr(values, f"scale_{p}")
+            if v.scale != scale_:
+                scale_changes.append(f"{p}: {v.scale} -> {scale_}")
+            v.scale = scale_
+
+        if scale_changes:
+            LOG.info(f"Scale changes: {', '.join(scale_changes)}")
+            LOG.info(f"Scale changes: {', '.join(scale_changes)}")
+
+        self._acq_parameter = values._acq_parameter
+        self._step_type = values._step_type
+        self.detector_name = values.detector_name
+        self.scanner_name = values.scanner_name
+        IsoldeOfflineBaseEnv.taus = self._convert_taus_to_array(values.taus)
+
+        # Beam presence threshold
+        self._beam_presence_threshold = values._beam_presence_threshold
+
+        # Number of acquisitions per setting for averaging
+        self._n_acqs_avg = values._n_acqs_avg
+
+        if not any_enabled:
+            LOG.error("Configuration error: No parameters enabled")
+            raise coi.BadConfig("Must enable at least one parameter")
+
+        LOG.info("Configuration applied successfully")
+
+    def _convert_taus_to_str(self) -> str:
+        taus_ = ','.join([str(tau) for tau in IsoldeOfflineBaseEnv.taus])
+        return taus_
+
+    def _convert_taus_to_array(self, taus_str: str) -> np.ndarray:
+        return np.array([float(tau) for tau in taus_str.split(",")])
+
+    def close(self) -> None:
+        """Clean up"""
+        pass
+
+    def render(self, mode: str = "human") -> t.Any:
+        """Render the environment for visualization."""
+        if mode == "matplotlib_figures":
+            return self.renderer.update()
+        return super().render(mode)
+
+    def iter_updates(self, figure: "Figure") -> RenderGenerator:
+        """Generator that updates the given figure with beam
+        size evolution with error bars."""
+        import numpy as np
+
+        # Create single subplot with both H and V beam sizes
+        ax: "Axes" = figure.subplots(1, 1)
+
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Beam sigma (mm)")
+
+        while True:
+            yield
+
+            # Update data
+            if len(self._iteration_history) > 0:
+                iterations = np.array(self._iteration_history)
+                sigma_h = np.array(self._beam_sigma_h_history)
+                sigma_v = np.array(self._beam_sigma_v_history)
+                sigma_h_std = np.array(self._beam_sigma_h_std_history)
+                sigma_v_std = np.array(self._beam_sigma_v_std_history)
+
+                # Clear and redraw with error bars
+                ax.clear()
+                ax.errorbar(
+                    iterations,
+                    sigma_h,
+                    yerr=sigma_h_std,
+                    fmt="o-",
+                    color="tab:blue",
+                    label="Horizontal",
+                    capsize=3,
+                )
+                ax.errorbar(
+                    iterations,
+                    sigma_v,
+                    yerr=sigma_v_std,
+                    fmt="o-",
+                    color="tab:red",
+                    label="Vertical",
+                    capsize=3,
+                )
+
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("Beam sigma (mm)")
+                ax.legend()
+
+                figure.tight_layout()
+
+    def get_initial_params(
+        self, *, seed: int | None = None, options: InfoDict | None = None
+    ) -> t.Any:
+        """Return x0 for optimizer to start. Here we return zeros since
+        we do a relative optimization around the initial settings. The
+        unscaling and adding to initial_currents takes place in
+        compute_single_objective."""
+        if self._acq_parameter == "Detector":
+            self._subs = [self._detector_subscriptions()[self.detector_name]]
+
+        else:
+            self._subs = [self._scanner_subscriptions()[self.scanner_name]]
+        LOG.info(f"Subscriptions configured: {self._subs}")
+
+        self._acquisition = utl.GenericEventBuilder(
+            provider=self._japc_provider,
+            subscriptions=self._subs,
+            selector="",
+        )
+
+        self._acquisition.start()
+        LOG.info("Generic event builder started for subscriptions")
+        self._initial_settings = self._fetch_initial_vals()
+        LOG.info(f"Initial currents fetched: {self._initial_settings}")
+
+        self.scaler = Scaler(self.optimization_space)
+
+        # Initialize run and iteration tracking
+        self._run_number = self._determine_run_number()
+        self._iteration_counter = 0
+        run_dir = self._data_path / f"run_{self._run_number:03d}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        LOG.info(f"Starting optimization run: Run_{self._run_number:03d}")
+
+        # Clear beam size history for new run
+        self._beam_sigma_h_history.clear()
+        self._beam_sigma_v_history.clear()
+        self._beam_sigma_h_std_history.clear()
+        self._beam_sigma_v_std_history.clear()
+        self._iteration_history.clear()
+
+        self._reset()
+
+        LOG.info(
+            "Initial parameters setup complete, returning zeros for relative optimization"
+        )
+        return np.zeros_like(self._initial_settings)
+
+    def _extract_mu_sigma(self, bsc_position, bsc_intensity) -> np.array:
+
+        fs = 450.0  # Sampling frequency in Hz (CHANGE this for your data)
+        cutoff = 10  # Cutoff frequency in Hz
+        order = 4  # Filter order
+
+        # === BUTTERWORTH LOW-PASS FILTER FUNCTION ===
+        def butter_lowpass_filter(data, cutoff, fs, order=4):
+            nyquist = 0.5 * fs
+            normal_cutoff = cutoff / nyquist
+            b, a = butter(order, normal_cutoff, btype='low', analog=False)
+            y = filtfilt(b, a, data)
+            return y
+
+        # === EXAMPLE USAGE ===
+        # Create example signal (low freq + high freq noise)
+        # Apply low-pass filter
+        filtered_bsc_position = butter_lowpass_filter(bsc_position, cutoff, fs, order)
+        filtered_bsc_intensity = butter_lowpass_filter(bsc_intensity, cutoff, fs, order)
+        max_peak = np.max(filtered_bsc_intensity)
+        min_peak = np.min(filtered_bsc_intensity)
+        peaks, _ = find_peaks(filtered_bsc_intensity)
+        diff_peak = max_peak-min_peak
+
+        def gaussian(x, mu, sigma, amp):
+            # Non-normalized Gaussian: amp * exp(-0.5 * ((x-mu)/sigma)^2)
+            return amp * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+        def fit_normal_from_xy(x, y, plot=True, title="Gaussian fit to (x, y) data"):
+            x = np.asarray(x, dtype=float)
+            y = np.asarray(y, dtype=float)
+
+            # Clean: finite, y >= 0
+            m = np.isfinite(x) & np.isfinite(y) & (y >= 0)
+            x, y = x[m], y[m]
+            if x.size < 3 or np.sum(y) <= 0:
+                 #raise ValueError("Not enough valid data to fit.")
+                mu = 17
+                sigma = 10
+                amp =  100
+                perr = np.array([np.nan, np.nan, np.nan])
+                perr[0] = 10
+                perr[1] = 10
+                perr[2] = 10
+
+            else:
+                # Sort by x (helps for plotting)
+                order = np.argsort(x)
+                x, y = x[order], y[order]
+                # Weighted-moment initial guesses
+                wsum = np.sum(y)
+                mu0 = np.sum(x * y) / wsum
+                var0 = np.sum(y * (x - mu0) ** 2) / wsum
+                sigma0 = np.sqrt(max(var0, 1e-12))
+                amp0 = np.max(y)
+
+                bounds = ([-np.inf, 1e-9, 0.0], [np.inf, np.inf, np.inf])
+
+                try:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("error", category=OptimizeWarning)
+                        popt, pcov = curve_fit(gaussian, x, y, p0=[mu0, sigma0, amp0],
+                                               bounds=bounds, maxfev=20000)
+                    mu, sigma, amp = popt
+                    perr = np.sqrt(np.diag(pcov)) if (pcov is not None and np.all(np.isfinite(pcov))) else [np.nan] * 3
+                except (RuntimeError, ValueError, OptimizeWarning):
+                    # manual fallback
+                    mu, sigma, amp = 10, 10, 100 # <-- put your manual values here
+                    perr = [10.0, 10.0, 10.0]
+                # Create smooth curve for display
+                xfit = np.linspace(x.min(), x.max(), 600)
+                yfit = gaussian(xfit, mu, sigma, amp)
+
+            return {
+                "mu": float(mu),
+                "sigma": float(sigma),
+                "amplitude": float(amp),
+                "mu_err": float(perr[0]),
+                "sigma_err": float(perr[1]),
+                "amp_err": float(perr[2]),
+            }
+    # ----------------------------
+    # Example usage:
+    # data = np.random.gamma(shape=2.0, scale=1.5, size=5000)  # clearly non-normal
+        res = fit_normal_from_xy(filtered_bsc_position, filtered_bsc_intensity, plot=False)
+        mu_err = res["mu_err"]
+        sigma_err = res["sigma_err"]
+
+        # Step 2: Find the most prominent peak (highest intensity)
+        if len(peaks) == 0 or diff_peak < 45 or mu_err >= 0.07 or sigma_err >= 0.07:
+            print("There is no beam")#raise ValueError("No peaks found in intensity data.")
+            mu = 17
+            sigma = 10
+        else:
+            # Get the index of the highest peak
+            '''peak_idx = peaks[np.argmax(filtered_bsc_intensity[peaks])]
+
+            # Step 3: Compute Full Width at Half Maximum (FWHM)
+            results_half = peak_widths(filtered_bsc_intensity, [peak_idx], rel_height=0.5)
+
+            # Convert width from index to position using interpolation
+
+            fwhm_start = filtered_bsc_position[int(results_half[2][0])]
+            fwhm_end = filtered_bsc_position[int(results_half[3][0])]
+            fwhm = fwhm_end - fwhm_start
+            # Output the result
+
+            mu = filtered_bsc_position[peak_idx]
+            sigma = fwhm'''
+            mu = res["mu"]
+            sigma = res["sigma"]
+
+        print(f"FWHM: {sigma:.3f}")
+        norm = np.sum(filtered_bsc_intensity)
+
+        return np.array([mu, sigma, norm])
+
+    def compute_single_objective(self, params: npt.NDArray) -> float:
+        """Optimizer callback function: using params suggested by
+        the optimizer algorithm, compute HW values and send via pjlsa,
+        wait for values to converge, acquire data for next shot, save,
+        and return objective value (scalar float)."""
+        LOG.info(f"Going to acquire objective with params: {params}")
+        # Calculate HW values and send off via pjlsa
+
+        if self._step_type == "Relative":
+            self._set_new_parameter_values(params)
+            mean_obs = self._get_next_observation()
+            return -mean_obs
+        else:
+            LOG.info(f"Scanner name: {self._subs[0]}")
+            utl.bsc_methods._is_valid_beam_scanner(self._subs[0])
+            LOG.info(f"STARTED BSC")
+            self._set_new_parameter_values(params)
+            LOG.info(f"Going to acquire objective with params: {params}")
+            time.sleep(3)
+            LOG.info(f"GETTING SENSITIVITY OF BSC")
+            sensitivity_level = utl.bsc_methods._get_bsc_sensitivity(self._subs[0], "")
+            beam_measurement = self._update_bsc_scale(self._subs[0], sensitivity_level.value)
+            self._get_next_bsc_observations()
+
+            hor_sigma = beam_measurement[2]
+            ver_sigma = beam_measurement[3]
+            hor_mu = beam_measurement[0]
+            ver_mu = beam_measurement[1]
+            print("mu_hor, mu_ver, sig_hor,sig_ver", hor_mu, ver_mu, hor_sigma, ver_sigma)
+
+            objective = (np.abs(hor_mu) + np.abs(ver_mu)) / 34
+            c1M = 17
+            c1m = -17
+            c11 = 2 / (c1M - c1m)
+            c12 = 1 - c11 * c1M
+
+            constr1 = utl.bsc_methods.constraint_in_ws(hor_mu, hor_sigma) * c11 + c12
+            constr2 = utl.bsc_methods.constraint_in_ws(ver_mu, ver_sigma) * c11 + c12
+
+            c2M = 0
+            c2m = -10
+            c21 = 2 / (c2M - c2m)
+            c22 = 1 - c21 * c2M
+
+            constr3 = utl.bsc_methods.constraint_size(hor_sigma)
+            constr3 = constr3 * c21 + c22
+            constr4 = utl.bsc_methods.constraint_size(ver_sigma)
+            constr4 = constr4 * c21 + c22
+            print("Objective: ", objective)
+            IsoldeOfflineBaseEnv.constraints_values = np.array([constr1, constr2, constr3, constr4])
+
+            return objective
+
+        # Create iteration directory
+        iteration_dir = (
+            self._data_path
+            / f"run_{self._run_number:03d}"
+            / f"it_{self._iteration_counter:03d}"
+        )
+        iteration_dir.mkdir(parents=True, exist_ok=True)
+        LOG.info(f"Created iteration directory: {iteration_dir}")
+
+    def _get_next_bsc_observations(self) -> None:
+        """Get new acquisitions from beam scanners, take average over self.num_measurements values,
+        log mean, and std values. Return mean value (=objective)."""
+        if not self.beam_params:
+            self.beam_params = {"hor_max_mean": [], "hor_max_std": [],
+                                "hor_mu_mean": [], "hor_mu_std": [],
+                                "hor_sigma_mean": [], "hor_sigma_std": [],
+                                "ver_max_mean": [], "ver_max_std": [],
+                                "ver_mu_mean": [], "ver_mu_std": [],
+                                "ver_sigma_mean": [], "ver_sigma_std": [],
+                                "hor_area_mean": [], "hor_area_std": [],
+                                "ver_area_mean": [], "ver_area_std": [],
+                                }
+
+        bsc_hor_area, bsc_ver_area, bsc_hor_max, bsc_ver_max, bsc_hor_mu, bsc_hor_sigma, bsc_ver_mu, bsc_ver_sigma = [], [], [], [], [], [], [], []
+
+        try:
+            while len(bsc_hor_max) < self._n_acqs_avg:
+
+                LOG.info("Before check if bsc is valid")
+                utl.bsc_methods._is_valid_beam_scanner(self._subs[0])
+                LOG.info("Checked if bsc is valid")
+                event = self._acquisition.last_event()
+
+                bsc_hor_pos = np.array(event[self._subs[0]].data["projPositionSet1"])
+                bsc_hor_int = np.array(event[self._subs[0]].data["projDataSet1"])
+                #bsc_ver_pos = np.array(event[self._subs[0]].data["projPositionSet2"])
+                #bsc_ver_int = np.array(event[self._subs[0]].data["projDataSet2"])
+
+                if bsc_hor_pos is None:
+                    LOG.warning("Acquisition is None.")
+                    continue
+                else:
+                    bsc_hor_max.append(np.max(bsc_hor_int))
+                    bsc_ver_max.append(np.max(bsc_ver_int))
+                    bsc_hor_params = self._extract_mu_sigma(bsc_hor_pos, bsc_hor_int)
+                    bsc_ver_params = self._extract_mu_sigma(bsc_ver_pos, bsc_ver_int)
+                    bsc_hor_mu.append(bsc_hor_params[0])
+                    bsc_hor_sigma.append(bsc_hor_params[1])
+                    bsc_hor_area.append(bsc_hor_params[2])
+                    bsc_ver_mu.append(bsc_ver_params[0])
+                    bsc_ver_sigma.append(bsc_ver_params[1])
+                    bsc_ver_area.append(bsc_ver_params[2])
+        except cancellation.CancelledError:
+            self._token.complete_cancellation()
+            raise
+
+        self.beam_params["hor_max_mean"].append(np.mean(bsc_hor_max))
+        self.beam_params["hor_max_std"].append(np.std(bsc_hor_max) / np.sqrt(len(bsc_hor_max)))
+        self.beam_params["hor_mu_mean"].append(np.mean(bsc_hor_mu))
+        self.beam_params["hor_mu_std"].append(np.std(bsc_hor_mu) / np.sqrt(len(bsc_hor_mu)))
+        self.beam_params["hor_sigma_mean"].append(np.mean(bsc_hor_sigma))
+        self.beam_params["hor_sigma_std"].append(np.std(bsc_hor_sigma) / np.sqrt(len(bsc_hor_sigma)))
+        self.beam_params["ver_max_mean"].append(np.mean(bsc_ver_max))
+        self.beam_params["ver_max_std"].append(np.std(bsc_ver_max) / np.sqrt(len(bsc_ver_max)))
+        self.beam_params["ver_mu_mean"].append(np.mean(bsc_ver_mu))
+        self.beam_params["ver_mu_std"].append(np.std(bsc_ver_mu) / np.sqrt(len(bsc_ver_mu)))
+        self.beam_params["ver_sigma_mean"].append(np.mean(bsc_ver_sigma))
+        self.beam_params["ver_sigma_std"].append(np.std(bsc_ver_sigma) / np.sqrt(len(bsc_ver_sigma)))
+        self.beam_params["hor_area_mean"].append(np.mean(bsc_hor_area))
+        self.beam_params["hor_area_std"].append(np.std(bsc_hor_area) / np.sqrt(len(bsc_hor_area)))
+        self.beam_params["ver_area_mean"].append(np.mean(bsc_ver_area))
+        self.beam_params["ver_area_std"].append(np.std(bsc_ver_area) / np.sqrt(len(bsc_ver_area)))
+
+    def _get_next_observation(self) -> float:
+        """Loop until we get a valid acquisition from Tape station and
+        other subscriptions.
+
+        Returns:
+            mean value
+        """
+        LOG.info("Starting acquisition loop")
+
+        values = []
+
+        try:
+            while len(values) < self._n_acqs_avg:
+                event = self._acquisition.last_event()
+                acq_value = event[self._subs[0]].data["lastAqn"]
+                if acq_value is None:
+                    LOG.warning("Acquisition is None.")
+                    continue
+                else:
+                    values.append(acq_value)
+
+            #self._save_data(acq_value)
+
+            # Extract objective
+            #mean_value = self.fc_detector_scale * np.mean(values)
+            std_value = self.fc_detector_scale * np.std(values) / np.sqrt(len(values))
+
+            #self.beam_current["mean"].append(mean_value)
+            #self.beam_current["std"].append(std_value)
+
+            return values[-1]
+
+        except cancellation.CancelledError:
+            self._token.complete_cancellation()
+            raise
+
+    def _save_data(
+        self, acqs: dict[str, pyda.access.PropertyRetrievalResponse]
+    ) -> None:
+        """Serialize event and dump to json file marked with timestamp."""
+        t_now_str = datetime.now().strftime("%Y%m%d_%H_%M_%S_%f")
+
+        # Build hierarchical path: run_XXX/it_YYY/[extref/]timestamp.json
+        fpath = (
+            self._data_path
+            / f"run_{self._run_number:03d}"
+            / f"it_{self._iteration_counter:03d}"
+            / f"{t_now_str}.json"
+        )
+
+        # Extract only relevant data: keep everything for the BSGs,
+        # only indx 0 for tape station, and only intensity field for BCT.
+        serialized_event = utl.serialize_event(acqs)
+
+        bsg_h = f"PSB.{self._target}.BSFH01.UCAP/Analysis"
+        bsg_v = f"PSB.{self._target}.BSFV01.UCAP/Analysis"
+        bct = self._beam_presence_bct_addr
+        tape = "Tapestation"
+
+        data_to_save = {
+            bsg_h: serialized_event[bsg_h],
+            bsg_v: serialized_event[bsg_v],
+        }
+
+        data_to_save[tape] = {
+            "acq_stamp": acqs[tape].header.acquisition_timestamp,
+            "cycle_stamp": float(acqs[tape].data["lastCycleStartTime"]),
+            "selector": "",
+            "data": serialized_event[tape]["data"].copy(),
+        }
+        # select indx 0
+        fields = [
+            "measurement0Timestamp",
+            "measurement0Count",
+            "measurement1Timestamp",
+            "measurement1Count",
+            "measurement2Timestamp",
+            "measurement2Count",
+            "measurement3Timestamp",
+            "measurement3Count",
+        ]
+        for k in fields:
+            data_to_save[tape]["data"][k] = data_to_save[tape]["data"][k][0]
+
+        with open(fpath, "w") as fid:
+            json.dump(data_to_save, fid)
+        LOG.info(f"Data saved to: {fpath.relative_to(self._data_path.parent)}")
+
+    def _wait_for_convergence(self, target_currents: npt.NDArray) -> None:
+        """Wait for acquired parameter values to converge to target values."""
+        LOG.info("Waiting for acquired currents to converge")
+        convergence_start_time = time.time()
+        last_send_time = convergence_start_time
+        resend_period_s = 8
+        iteration_count = 0
+
+        while True:
+            iteration_count += 1
+            LOG.debug(
+                f"Convergence check iteration {iteration_count} "
+                f"(elapsed: {time.time() - convergence_start_time:.1f} s)"
+            )
+            with self._token.wait_handle:
+                self._token.wait_handle.wait_for(
+                    lambda: self._token.cancellation_requested, timeout=1.0
+                )
+                self._token.raise_if_cancellation_requested()
+
+            # Check convergence with per-parameter tolerances
+            acquired_currents = self.read_back_params()
+            all_converged = True
+            for param_addr, setting, acquisition, tolerance in zip(
+                self._param_addrs,
+                target_currents,
+                acquired_currents,
+                self._param_tolerances,
+            ):
+                if abs(setting - acquisition) > tolerance:
+                    LOG.warning(
+                        f"Parameter {param_addr} not converged: "
+                        f"setting {setting:.2f}, "
+                        f"acquisition {acquisition:.2f}, "
+                        f"tol {tolerance:.4f}",
+                    )
+                    all_converged = False
+
+            if all_converged:
+                convergence_time = time.time() - convergence_start_time
+                LOG.info(
+                    f"All readbacks within settings tolerance after "
+                    f"{convergence_time:.2f} s"
+                )
+                break
+
+            # Not converged: check if we need to re-send
+            seconds_since_last_send = time.time() - last_send_time
+            if seconds_since_last_send >= resend_period_s:
+                LOG.warning(
+                    "No convergence after %.1f s; reapplying settings.",
+                    seconds_since_last_send,
+                )
+                if not DEBUG:
+                    LOG.info("Resending LSA trim")
+                    param_addrs = [p + "#ccv1" for p in self._param_addrs]
+                    LOG.info("param_addrs: ", param_addrs)
+                    utl.utils_pjlsa.set_scalar(param_addrs, target_currents)
+                    """self.send_lsa_trim(
+                        param_addrs=param_addrs,
+                        hw_vals=target_currents,
+                    )"""
+                else:
+                    LOG.debug("DEBUG mode: Skipping LSA trim resend")
+                last_send_time = time.time()
+
+    def send_lsa_trim(
+        self,
+        param_addrs: list[str],
+        hw_vals: np.ndarray,
+    ) -> None:
+        """Send setting changes as single LSA transient trim."""
+        LOG.info(f"Preparing LSA trim for {len(param_addrs)} parameters")
+        settings = {}
+        for param, current in zip(param_addrs, hw_vals):
+            settings[param] = current
+        descr = f"Trim from GeOFF {self._env_name}"
+
+        #raise Exception
+
+        LOG.info(f"LSA trim settings: {settings}")
+        LOG.debug(f"Trim description: {descr}")
+
+        if DEBUG:
+            LOG.warning("DEBUG mode: Skipping actual LSA trim to hardware")
+            return
+
+        LOG.info("Sending LSA transient trim to hardware...")
+        trim_scalar_settings(
+            settings=settings,
+            user="",
+            relative=False,
+            transient=True,
+            description=descr,
+        )
+        LOG.info("LSA trim completed successfully")
+
+    def _set_new_parameter_values(self, params: np.ndarray) -> None:
+        """Transform parameter values to real space and send to hardware  using
+        pyjapc calls. Keep log of actors. Note that we also clip to the allowed
+        value range. Note that since we define the self.optimization_space already
+        in such a way as to never go out of allowed range this np.clip call should
+        not actually do something other than "fixing" numerical errors. This is the
+        correct way to do it, since the optimizer algorithm also has to be aware of
+        the bounds and the values we actually set in the machine have to correspond
+        to those proposed by the algorithm to ensure consistency of the next
+        observation."""
+        print("Set new parameter values", params)
+
+        if self._step_type == "Absolute":
+            if not self.actor_values:
+                self.actor_values = np.array([])
+
+            val_list = []
+            norm_val_list = []
+            params_unscaled = self.scaler.unscale(params)
+            devices = self._setup_parameters()
+
+            # TO TEST: is self._param_addrs correct here?
+            for p, p_val, p_norm in zip(self._param_addrs, params_unscaled, params):
+                field = (p + "#ccv1")
+                LOG.info(f"SET SCALAR: {p}, {field}")
+                utl.utils_pjlsa.set_scalar((p + "#ccv1"), p_val)
+                norm_val_list.append(p_norm)
+                val_list.append(p_val)
+            self.actor_values = np.append(self.actor_values, val_list)
+
+            # Wait for settings to be applied (fixed time interval here)
+            # time.sleep(self.TIME_DELAY_JAPC_SET)
+            self._wait_for_convergence(target_currents=self.actor_values)
+        else:
+            actor_values = self._initial_settings + np.array(self._param_scales) * params
+            LOG.info(f"Computed HW currents: {actor_values}")
+            for p, v in zip(self._param_addrs, actor_values):
+                LOG.info(f"Sending new value for {p}: {v:.2f} A")
+            if not DEBUG:
+                param_addrs = [p + "#ccv1" for p in self._param_addrs]
+                LOG.info(f"HERE PARAM ADDRS: {param_addrs}, {actor_values}")
+                for i in range(len(param_addrs)):
+                    utl.utils_pjlsa.set_scalar(param_addrs[i], actor_values[i])
+            else:
+                LOG.debug("DEBUG mode: Skipping LSA trim for main parameters")
+            LOG.info("Waiting for parameter convergence...")
+            self._wait_for_convergence(target_currents=actor_values)
+
+            LOG.info("Parameters converged, acquiring data...")
+
+    def read_back_params(self) -> list[float]:
+        """Read back values of params via acquisition property."""
+        selector = ""
+        LOG.info(f"Using selector {selector} for acqs.")
+
+        # Get raw acquisitions
+        acquired_currents = []
+        for addr in self._param_readback_addrs:
+            res = self._pyda_client.get(endpoint=addr, context=selector)
+            v = float(res.data["ccv1"])
+            LOG.info(f"Readback for param {addr}: {v}")
+            acquired_currents.append(v)
+        return acquired_currents
+
+    # This function can be used to add custom plots to the GeOFF GUI
+    # I can share an example if you like.
+    # def render(self, mode: str = "human") -> t.Any:
+    #     pass
+
+    def _reset(self):
+        """Whenever we update the subscriptions, we also have to clear
+        logging buffers."""
+        self.beam_current = None
+        self.beam_params = None
+        self.actor_values = None
+
+
+    def _update_bsc_scale(self, bsc_addr, sensitivity_level):
+        # Initial state
+        current_state = "initial"
+
+        bsc_addr = bsc_addr.replace("Acquisition", "Setting#sensitivity")
+
+        def __sensitivity__BSC70(bsc_addr, value):
+            return utl.utils_pjlsa.set_scalar(bsc_addr, value)
+
+        counts1 = 0
+        counts2 = 0
+        counts3 = 0
+        counts4 = 0
+        counts5 = 0
+        counts6 = 0
+
+        while current_state != "output":
+            if current_state == "initial":
+                print(current_state)
+                label = sensitivity_level
+                if label == 5:
+                    current_state = "sen1"
+                elif label == 4:
+                    current_state = "sen2"
+                elif label == 3:
+                    current_state = "sen3"
+                elif label == 2:
+                    current_state = "sen4"
+                elif label == 1:
+                    current_state = "sen5"
+                elif label == 0:
+                    current_state = "sen6"
+
+            elif current_state == "sen1":
+                print(current_state)
+                label = 5
+                counts1 = counts1 + 1
+                __sensitivity__BSC70(bsc_addr, label)
+                time.sleep(7)
+                self._get_next_bsc_observations()
+                measures0 = self.beam_params["hor_max_mean"]
+                measures1 = self.beam_params["ver_max_mean"]
+                print("peaks", measures0[-1], measures1[-1])
+                if (measures0[-1] >= 2000 or measures1[-1] >= 2000) and counts1 <= 1:
+                    current_state = "sen2"
+                elif measures0[-1] < 2000 and measures1[-1] < 2000 or counts1 > 1:
+                    current_state = "scale1"
+
+            elif current_state == "sen2":
+                print(current_state)
+                counts2 = counts2 + 1
+                label = 4
+                __sensitivity__BSC70(bsc_addr, label)
+                time.sleep(7)
+                self._get_next_bsc_observations()
+                measures0 = self.beam_params["hor_max_mean"]
+                measures1 = self.beam_params["ver_max_mean"]
+
+                if (measures0[-1] >= 2000 or measures1[-1] >= 2000) and counts2 <= 1:
+                    current_state = "sen3"
+                elif (measures0[-1] < 2000 and measures1[-1] < 2000) and (
+                        measures0[-1] >= 200 or measures1[-1] >= 200) or counts2 > 1:
+                    current_state = "scale1"
+                elif (measures0[-1] < 200 and measures1[-1] < 200) and counts2 <= 1:
+                    current_state = "sen1"
+
+            elif current_state == "sen3":
+                print(current_state)
+                counts3 = counts3 + 1
+                label = 3
+                __sensitivity__BSC70(bsc_addr, label)
+                time.sleep(7)
+                self._get_next_bsc_observations()
+                measures0 = self.beam_params["hor_max_mean"]
+                measures1 = self.beam_params["ver_max_mean"]
+
+                if (measures0[-1] >= 2000 or measures1[-1] >= 2000) and counts3 <= 1:
+                    current_state = "sen4"
+                elif (measures0[-1] < 2000 and measures1[-1] < 2000) and (
+                        measures0[-1] >= 200 or measures1[-1] >= 200) or counts3 > 1:
+                    current_state = "scale1"
+                elif (measures0[-1] < 200 and measures1[-1] < 200) and counts3 <= 1:
+                    current_state = "sen2"
+
+            elif current_state == "sen4":
+                print(current_state)
+                counts4 = counts4 + 1
+                label = 2
+                __sensitivity__BSC70(bsc_addr, label)
+                time.sleep(7)
+                self._get_next_bsc_observations()
+                measures0 = self.beam_params["hor_max_mean"]
+                measures1 = self.beam_params["ver_max_mean"]
+
+                if (measures0[-1] >= 2000 or measures1[-1] >= 2000) and counts4 <= 1:
+                    current_state = "sen5"
+                elif (measures0[-1] < 2000 and measures1[-1] < 2000) and (
+                        measures0[-1] >= 200 or measures1[-1] >= 200) or counts4 > 1:
+                    current_state = "scale1"
+                elif (measures0[-1] < 200 and measures1[-1] < 200) and counts4 <= 1:
+                    current_state = "sen3"
+
+            elif current_state == "sen5":
+                print(current_state)
+                counts5 = counts5 + 1
+                label = 1
+                __sensitivity__BSC70(bsc_addr, label)
+                time.sleep(7)
+                self._get_next_bsc_observations()
+                measures0 = self.beam_params["hor_max_mean"]
+                measures1 = self.beam_params["ver_max_mean"]
+                if (measures0[-1] >= 2000 or measures1[-1] >= 2000) and counts5 <= 1:
+                    current_state = "sen6"
+                elif (measures0[-1] < 2000 and measures1[-1] < 2000) and (
+                        measures0[-1] >= 200 or measures1[-1] >= 200) or counts5 > 1:
+                    current_state = "scale1"
+                elif (measures0[-1] < 200 and measures1[-1] < 200) and counts5 <= 1:
+                    current_state = "sen4"
+
+            elif current_state == "sen6":
+                print(current_state)
+                counts6 = counts6 + 1
+                label = 0
+                __sensitivity__BSC70(bsc_addr, label)
+                time.sleep(7)
+                self._get_next_bsc_observations()
+                measures0 = self.beam_params["hor_max_mean"]
+                measures1 = self.beam_params["ver_max_mean"]
+                if measures0[-1] >= 200 or measures1[-1] >= 200 or counts6 > 1:
+                    current_state = "scale1"
+                elif (measures0[-1] < 200 and measures1[-1] < 200) and counts6 <= 1:
+                    current_state = "sen5"
+
+            elif current_state == "scale1":
+                print(current_state)
+                flag_t = True
+                final_f = True
+                measures4 = self.beam_params["hor_mu_mean"]
+                measures5 = self.beam_params["ver_mu_mean"]
+                measures6 = self.beam_params["hor_sigma_mean"]
+                measures7 = self.beam_params["ver_sigma_mean"]
+
+                if flag_t:
+                    current_state = "output"
+
+                    # Output state
+        result = np.array(
+            [measures4[-1], measures5[-1], measures6[-1], measures7[-1]])
+        return result
